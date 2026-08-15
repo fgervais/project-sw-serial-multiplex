@@ -1,0 +1,17 @@
+[package]
+name = "sermuxd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-serial = "5.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+strip = true
