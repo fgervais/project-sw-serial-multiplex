@@ -41,9 +41,10 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
-    /// Per-client broadcast queue depth, in chunks (~4 KiB each). A client
-    /// that falls behind drops oldest data beyond this depth (loudly, for
-    /// that client only) instead of slowing everyone else down.
+    /// Per-client broadcast queue depth, in chunks (~4 KiB each).
+    ///
+    /// A client that falls behind drops oldest data beyond this depth
+    /// (loudly, for that client only) instead of slowing everyone else down.
     #[arg(long, default_value_t = 64)]
     queue_chunks: usize,
 }
