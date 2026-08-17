@@ -109,14 +109,17 @@ others.
 - Language: **Rust**.
 - Crates: `serialport`, `tokio`, `tokio-util`, `clap`, `nix` (PTY). All pure
   Rust — no C dependencies.
-- Default build already produces a single self-contained binary (dynamic
-  glibc). For a fully static binary:
+- **Requirement: release artifacts are single, fully static binaries** via
+  musl static linking — they must run on any Linux host regardless of its
+  libc version (e.g. copying the binary to an older host or a Yocto rootfs):
   ```bash
   rustup target add x86_64-unknown-linux-musl
   cargo build --release --target x86_64-unknown-linux-musl
   ```
+  (A plain `cargo build --release` works for development but links the
+  build machine's glibc dynamically; it is not the release artifact.)
 - `Cargo.toml` release profile: `lto = true`, `strip = true`
-  (single stripped executable, expected ~1–3 MB).
+  (single stripped executable, ~2 MB).
 
 ## CLI sketch
 
