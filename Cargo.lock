@@ -427,6 +427,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "nix 0.31.3",
  "tokio",
  "tokio-serial",
  "tracing",

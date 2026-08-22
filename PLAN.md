@@ -131,9 +131,9 @@ sermuxd --port /dev/ttyUSB0 --baud 115200 \
 
 ## Milestones
 
-1. **Socat replacement:** serial↔broadcast hub + TCP data clients, no
+1. ✅ **Socat replacement:** serial↔broadcast hub + TCP data clients, no
    arbitration (everyone can write, like socat today). Already useful.
-2. **PTY client:** local minicom via `/tmp/ttyMUX0`.
+2. ✅ **PTY client:** local minicom via `/tmp/ttyMUX0`.
 3. **Arbiter + control port:** TX lock, `CLAIM`/`RELEASE`/`STATUS`, token
    identity, auto-release on disconnect, reject notice (opt-in).
 4. **Polish:** replay buffer, wire logging (timestamped capture of
