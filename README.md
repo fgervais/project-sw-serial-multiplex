@@ -41,6 +41,11 @@ For local console access, point minicom at the daemon's PTY symlink (default
 minicom -D /tmp/ttyMUX0
 ```
 
+A rolling replay buffer (default 256 KiB, tune with `--replay-kb`, 0
+disables) keeps recent serial output; every newly connected client receives
+a copy of it before joining the live stream, so a late joiner still sees
+the boot log.
+
 Run with `--help` for all options (`--port`, `--baud`, `--data-port`,
-`--bind`, `--queue-chunks`, `--pty-link`). Logs follow the `RUST_LOG` env
-filter, default `info`.
+`--bind`, `--queue-chunks`, `--pty-link`, `--replay-kb`). Logs follow the
+`RUST_LOG` env filter, default `info`.

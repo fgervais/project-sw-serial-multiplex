@@ -6,10 +6,14 @@
 //! may write, like socat).
 //! Milestone 2: local PTY client — minicom attaches to a stable symlink and
 //! behaves like any other client.
+//! Replay buffer (pulled forward from milestone 4): a global rolling buffer
+//! of recent serial output; every newly connected client gets a copy before
+//! joining the live stream.
 
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -54,14 +58,81 @@ struct Args {
     /// Symlink path for the local PTY client (point minicom at it).
     #[arg(long, default_value = "/tmp/ttyMUX0")]
     pty_link: PathBuf,
+
+    /// Rolling replay buffer size, in KiB, sent to each new client (0 disables).
+    #[arg(long, default_value_t = 256)]
+    replay_kb: usize,
 }
 
-/// Shared hub: serial RX fan-out (broadcast) and client TX fan-in (mpsc).
+/// One serial RX chunk, tagged with a sequence number so a client that took
+/// a replay-buffer snapshot can skip live chunks it already has.
+#[derive(Clone)]
+struct Chunk {
+    seq: u64,
+    bytes: Bytes,
+}
+
+/// Global rolling replay buffer: a suffix of everything the serial port ever
+/// emitted, capped in size. Snapshots are copies — reading never consumes.
+struct ReplayBuffer {
+    inner: Mutex<ReplayInner>,
+}
+
+struct ReplayInner {
+    chunks: VecDeque<Chunk>,
+    bytes: usize,
+    cap: usize,
+}
+
+impl ReplayBuffer {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: Mutex::new(ReplayInner {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                cap,
+            }),
+        }
+    }
+
+    fn push(&self, mut chunk: Chunk) {
+        let mut inner = self.inner.lock().expect("replay mutex poisoned");
+        if inner.cap == 0 {
+            return;
+        }
+        // Roll over: drop oldest chunks until the new one fits.
+        while !inner.chunks.is_empty() && inner.bytes + chunk.bytes.len() > inner.cap {
+            let old = inner.chunks.pop_front().expect("non-empty");
+            inner.bytes -= old.bytes.len();
+        }
+        // A single chunk larger than the cap keeps only its own tail, so the
+        // buffer invariant (a stream suffix of at most `cap` bytes) holds.
+        if chunk.bytes.len() > inner.cap {
+            chunk.bytes = chunk.bytes.slice(chunk.bytes.len() - inner.cap..);
+        }
+        inner.bytes += chunk.bytes.len();
+        inner.chunks.push_back(chunk);
+    }
+
+    /// Copy of the current buffer plus the highest sequence number in it, so
+    /// the caller can skip live broadcast chunks already covered here.
+    fn snapshot(&self) -> (u64, Vec<Bytes>) {
+        let inner = self.inner.lock().expect("replay mutex poisoned");
+        let max_seq = inner.chunks.back().map(|c| c.seq).unwrap_or(0);
+        let chunks = inner.chunks.iter().map(|c| c.bytes.clone()).collect();
+        (max_seq, chunks)
+    }
+}
+
+/// Shared hub: serial RX fan-out (broadcast + replay) and client TX fan-in
+/// (mpsc).
 #[derive(Clone)]
 struct Hub {
-    /// Serial -> clients. Every client subscribes; `Bytes` clones are cheap
-    /// refcount bumps.
-    rx: broadcast::Sender<Bytes>,
+    /// Serial -> clients live stream. Every client subscribes; `Chunk` clones
+    /// are cheap (`Bytes` is a refcount bump).
+    rx: broadcast::Sender<Chunk>,
+    /// Rolling replay buffer, snapshotted (copied) for each new client.
+    replay: Arc<ReplayBuffer>,
     /// Clients -> serial. Single consumer is the serial TX task.
     tx: mpsc::Sender<Bytes>,
 }
@@ -71,7 +142,8 @@ struct Hub {
 async fn run_serial(
     port: String,
     baud: u32,
-    hub_rx: broadcast::Sender<Bytes>,
+    hub_rx: broadcast::Sender<Chunk>,
+    replay: Arc<ReplayBuffer>,
     mut hub_tx: mpsc::Receiver<Bytes>,
 ) -> Result<()> {
     let serial = tokio_serial::new(&port, baud)
@@ -80,15 +152,25 @@ async fn run_serial(
     info!(port, baud, "serial port open");
     let (mut reader, mut writer) = tokio::io::split(serial);
 
-    // Serial -> broadcast.
+    // Serial -> replay buffer + broadcast.
     let mut rx_task = tokio::spawn(async move {
         let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut seq: u64 = 0;
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => anyhow::bail!("serial port returned EOF"),
                 Ok(n) => {
+                    seq += 1;
+                    let chunk = Chunk {
+                        seq,
+                        bytes: Bytes::copy_from_slice(&buf[..n]),
+                    };
+                    // Push before broadcasting: a client subscribing right now
+                    // either misses the chunk twice (fine, it pre-dates its
+                    // snapshot) or has it in both and dedups by seq.
+                    replay.push(chunk.clone());
                     // No receivers is normal (zero clients); not an error.
-                    let _ = hub_rx.send(Bytes::copy_from_slice(&buf[..n]));
+                    let _ = hub_rx.send(chunk);
                 }
                 Err(e) => anyhow::bail!("serial read error: {e}"),
             }
@@ -202,14 +284,27 @@ async fn run_pty(hub: Hub, pty: Pty) -> Result<()> {
     let reader_fd = AsyncFd::new(pty.master.try_clone().context("dup pty master")?)?;
     let writer_fd = AsyncFd::new(pty.master)?;
 
+    // Subscribe before snapshotting so nothing is missed in between; chunks
+    // present in both are deduplicated by sequence number.
     let mut rx = hub.rx.subscribe();
+    let (replayed, snapshot) = hub.replay.snapshot();
     let tx = hub.tx.clone();
 
-    // Broadcast -> PTY master.
+    // Replay snapshot, then broadcast -> PTY master.
     let writer_task = tokio::spawn(async move {
+        for bytes in &snapshot {
+            if pty_write_all(&writer_fd, bytes).await.is_err() {
+                return;
+            }
+        }
         loop {
-            let chunk = match rx.recv().await {
-                Ok(chunk) => chunk,
+            let bytes = match rx.recv().await {
+                Ok(chunk) => {
+                    if chunk.seq <= replayed {
+                        continue; // already in the snapshot
+                    }
+                    chunk.bytes
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(chunks = n, "slow PTY consumer dropped data");
                     Bytes::from(format!(
@@ -218,7 +313,7 @@ async fn run_pty(hub: Hub, pty: Pty) -> Result<()> {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            if pty_write_all(&writer_fd, &chunk).await.is_err() {
+            if pty_write_all(&writer_fd, &bytes).await.is_err() {
                 break;
             }
         }
@@ -254,15 +349,26 @@ async fn handle_client(stream: TcpStream, hub: Hub) -> Result<()> {
     info!(%peer, "client connected");
 
     let (mut sock_reader, mut sock_writer) = stream.into_split();
+    // Subscribe before snapshotting so nothing is missed in between; chunks
+    // present in both are deduplicated by sequence number.
     let mut rx = hub.rx.subscribe();
+    let (replayed, snapshot) = hub.replay.snapshot();
     let tx = hub.tx.clone();
 
-    // Broadcast -> client socket.
+    // Replay snapshot, then broadcast -> client socket.
     let writer_task = tokio::spawn(async move {
+        for bytes in &snapshot {
+            if sock_writer.write_all(bytes).await.is_err() {
+                return;
+            }
+        }
         loop {
             match rx.recv().await {
                 Ok(chunk) => {
-                    if sock_writer.write_all(&chunk).await.is_err() {
+                    if chunk.seq <= replayed {
+                        continue; // already in the snapshot
+                    }
+                    if sock_writer.write_all(&chunk.bytes).await.is_err() {
                         break;
                     }
                 }
@@ -311,10 +417,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let (bcast_tx, _) = broadcast::channel::<Bytes>(args.queue_chunks);
+    let (bcast_tx, _) = broadcast::channel::<Chunk>(args.queue_chunks);
     let (serial_tx, serial_rx) = mpsc::channel::<Bytes>(TX_QUEUE_CHUNKS);
+    let replay = Arc::new(ReplayBuffer::new(args.replay_kb * 1024));
     let hub = Arc::new(Hub {
         rx: bcast_tx.clone(),
+        replay: replay.clone(),
         tx: serial_tx,
     });
 
@@ -336,6 +444,7 @@ async fn main() -> Result<()> {
         args.port.clone(),
         args.baud,
         bcast_tx,
+        replay,
         serial_rx,
     ));
 

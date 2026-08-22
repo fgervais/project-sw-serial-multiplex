@@ -100,9 +100,17 @@ others.
   Sub-millisecond + network latency; kernel serial buffers absorb bursts.
 - **TX:** minimal channel from lock holder to serial task. No line buffering
   — a typed character is sent immediately, like a real port.
-- **Replay buffer (stretch, off by default):** ring buffer of the last
-  ~256 KB of serial output, sent to newly connected clients so a late joiner
-  sees recent history (e.g. boot log) before joining the live stream.
+- **Replay buffer:** global rolling buffer of the last ~256 KB of serial
+  output (`--replay-kb`, 0 disables). Every newly connected client gets a
+  copy, then joins the live stream — snapshots are never consumed, the
+  buffer only rolls over at the size cap. Chunks carry sequence numbers so
+  the handover from replay to live is gap-free and duplicate-free. (Pulled
+  forward from milestone 4, where it was planned as opt-in.)
+
+  Note: this covers clients the daemon sees connect (TCP, and the PTY at
+  daemon startup). A minicom that attaches to the PTY *later* still only
+  sees whatever the kernel PTY buffer happens to hold — the daemon cannot
+  observe slave-side opens while it holds the slave fd open itself.
 
 ## Build & packaging
 
@@ -136,8 +144,9 @@ sermuxd --port /dev/ttyUSB0 --baud 115200 \
 2. ✅ **PTY client:** local minicom via `/tmp/ttyMUX0`.
 3. **Arbiter + control port:** TX lock, `CLAIM`/`RELEASE`/`STATUS`, token
    identity, auto-release on disconnect, reject notice (opt-in).
-4. **Polish:** replay buffer, wire logging (timestamped capture of
-   everything on the wire), systemd unit, `CLAIM --wait`.
+4. **Polish:** ~~replay buffer~~ (done — pulled forward), wire logging
+   (timestamped capture of everything on the wire), systemd unit,
+   `CLAIM --wait`.
 
 ## Rejected / deferred alternatives
 
